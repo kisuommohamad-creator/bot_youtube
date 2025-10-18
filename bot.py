@@ -11,9 +11,10 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 import re
 from datetime import timedelta
+import shutil
 
 # إعداد السجلات
 logging.basicConfig(
@@ -22,426 +23,490 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# رمز البوت من المتغيرات البيئية
+# رمز البوت
 TOKEN = os.getenv('BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("❌ يجب تعيين متغير BOT_TOKEN!")
 
-# مجلد مؤقت للتحميلات
-DOWNLOAD_FOLDER = 'downloads'
+# مجلد التحميلات
+DOWNLOAD_FOLDER = '/tmp/downloads'
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# قاموس لتخزين معلومات الفيديوهات مؤقتاً
-video_info_cache = {}
+# ذاكرة مؤقتة
+video_cache = {}
+
+# حد أقصى لحجم الملف (2GB)
+MAX_FILE_SIZE = 2000 * 1024 * 1024
+
+
+def clean_filename(filename):
+    """تنظيف اسم الملف"""
+    return re.sub(r'[^\w\s-]', '', filename)[:100]
+
+
+def format_duration(seconds):
+    """تنسيق المدة"""
+    if not seconds:
+        return "غير معروف"
+    return str(timedelta(seconds=int(seconds)))
+
+
+def format_views(count):
+    """تنسيق عدد المشاهدات"""
+    if not count:
+        return "0"
+    if count >= 1_000_000:
+        return f"{count/1_000_000:.1f}M"
+    elif count >= 1_000:
+        return f"{count/1_000:.1f}K"
+    return str(count)
 
 
 class YouTubeDownloader:
-    """فئة لمعالجة تحميلات يوتيوب"""
+    """معالج تحميل يوتيوب"""
     
     @staticmethod
-    def get_video_info(url):
-        """الحصول على معلومات الفيديو"""
+    def extract_info(url):
+        """استخراج معلومات الفيديو"""
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
+            'socket_timeout': 30,
         }
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 
-                # استخراج الجودات المتاحة
+                # استخراج الصيغ
                 formats = info.get('formats', [])
-                video_formats = {}
-                audio_formats = []
+                video_qualities = {}
                 
+                # فلترة الصيغ المناسبة
                 for f in formats:
-                    if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
-                        height = f.get('height')
-                        if height and height not in video_formats:
-                            video_formats[height] = f
-                    elif f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                        audio_formats.append(f)
+                    height = f.get('height')
+                    vcodec = f.get('vcodec', 'none')
+                    acodec = f.get('acodec', 'none')
+                    
+                    # فيديو + صوت
+                    if height and vcodec != 'none' and acodec != 'none':
+                        if height not in video_qualities or f.get('fps', 0) > video_qualities[height].get('fps', 0):
+                            video_qualities[height] = f
                 
                 return {
                     'title': info.get('title', 'Unknown'),
                     'duration': info.get('duration', 0),
-                    'thumbnail': info.get('thumbnail', ''),
+                    'thumbnail': info.get('thumbnail'),
                     'uploader': info.get('uploader', 'Unknown'),
-                    'view_count': info.get('view_count', 0),
-                    'description': info.get('description', '')[:200],
-                    'formats': video_formats,
-                    'audio_formats': audio_formats,
-                    'url': url
+                    'views': info.get('view_count', 0),
+                    'description': (info.get('description') or '')[:150],
+                    'url': url,
+                    'qualities': sorted(video_qualities.keys(), reverse=True),
                 }
+                
         except Exception as e:
-            logger.error(f"خطأ في الحصول على معلومات الفيديو: {e}")
+            logger.error(f"خطأ في استخراج المعلومات: {e}")
             return None
     
     @staticmethod
-    async def download_video(url, quality, format_type, progress_callback=None):
-        """تحميل الفيديو بجودة وصيغة محددة"""
-        filename = f"{DOWNLOAD_FOLDER}/{hash(url)}_{quality}.{format_type}"
+    async def download(url, quality='best', format_type='mp4', progress_msg=None):
+        """تحميل الفيديو"""
+        filename = f"{DOWNLOAD_FOLDER}/{clean_filename(str(hash(url)))}"
         
         ydl_opts = {
-            'format': f'best[height<={quality}]' if quality != 'audio' else 'bestaudio',
-            'outtmpl': filename,
+            'format': 'bestaudio/best' if quality == 'audio' else f'best[height<={quality}][ext=mp4]/best[height<={quality}]',
+            'outtmpl': f'{filename}.%(ext)s',
             'quiet': True,
             'no_warnings': True,
+            'socket_timeout': 30,
+            'retries': 3,
         }
         
+        # خيارات الصوت
         if format_type == 'mp3':
+            ydl_opts['format'] = 'bestaudio/best'
             ydl_opts['postprocessors'] = [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }]
+            ydl_opts['prefer_ffmpeg'] = True
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+                # التحميل
+                info = ydl.extract_info(url, download=True)
                 
-                # العثور على الملف المحمل
+                # العثور على الملف
+                downloaded_file = None
                 for file in os.listdir(DOWNLOAD_FOLDER):
-                    if file.startswith(str(hash(url))):
-                        return os.path.join(DOWNLOAD_FOLDER, file)
-                        
-                return filename
+                    if file.startswith(clean_filename(str(hash(url)))):
+                        downloaded_file = os.path.join(DOWNLOAD_FOLDER, file)
+                        break
+                
+                if downloaded_file and os.path.exists(downloaded_file):
+                    return downloaded_file, info.get('title', 'video')
+                    
+                return None, None
+                
         except Exception as e:
             logger.error(f"خطأ في التحميل: {e}")
-            return None
-
-
-def format_duration(seconds):
-    """تنسيق المدة الزمنية"""
-    return str(timedelta(seconds=seconds))
-
-
-def format_number(num):
-    """تنسيق الأرقام"""
-    if num >= 1_000_000:
-        return f"{num/1_000_000:.1f}M"
-    elif num >= 1_000:
-        return f"{num/1_000:.1f}K"
-    return str(num)
+            return None, None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر البدء"""
-    welcome_message = """
-🎬 **مرحباً بك في بوت تحميل فيديوهات يوتيوب!**
+    """أمر /start"""
+    welcome = """
+🎬 **أهلاً بك في بوت تحميل يوتيوب الاحترافي!**
 
-📌 **المميزات:**
-✅ تحميل بجودات مختلفة (144p - 1080p)
-✅ تحميل صوت MP3
-✅ دعم صيغ متعددة (MP4, MKV)
-✅ معاينة معلومات الفيديو
-✅ سريع وآمن
+━━━━━━━━━━━━━━━━━━━━
+✨ **المميزات:**
+✅ تحميل بجودات متعددة
+✅ تحويل إلى MP3
+✅ سريع وآمن 100%
+✅ دعم الفيديوهات الطويلة
 
-📝 **كيفية الاستخدام:**
-1️⃣ أرسل رابط فيديو يوتيوب
-2️⃣ اختر الجودة والصيغة المطلوبة
-3️⃣ انتظر التحميل والإرسال
+━━━━━━━━━━━━━━━━━━━━
+📝 **طريقة الاستخدام:**
 
-💡 مثال:
-`https://www.youtube.com/watch?v=xxxxx`
+1️⃣ أرسل رابط يوتيوب
+2️⃣ اختر الجودة المطلوبة  
+3️⃣ انتظر التحميل
 
-🚀 ابدأ الآن بإرسال رابط الفيديو!
+━━━━━━━━━━━━━━━━━━━━
+💡 **مثال:**
+`https://youtu.be/xxxxx`
+
+🚀 **ابدأ الآن!**
     """
     
     keyboard = [
-        [InlineKeyboardButton("📖 المساعدة", callback_data="help"),
-         InlineKeyboardButton("ℹ️ حول", callback_data="about")]
+        [
+            InlineKeyboardButton("📖 دليل الاستخدام", callback_data="help"),
+            InlineKeyboardButton("ℹ️ معلومات", callback_data="about")
+        ]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        welcome_message,
+        welcome,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة رابط يوتيوب"""
-    url = update.message.text
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الرسائل"""
+    text = update.message.text
     user_id = update.effective_user.id
     
-    # التحقق من صحة الرابط
-    youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
-    if not re.match(youtube_regex, url):
+    # فحص رابط يوتيوب
+    youtube_pattern = r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+    
+    if not re.search(youtube_pattern, text):
         await update.message.reply_text(
-            "❌ الرجاء إرسال رابط يوتيوب صحيح!"
+            "❌ **رابط غير صحيح!**\n\n"
+            "الرجاء إرسال رابط يوتيوب صحيح.\n\n"
+            "مثال:\n"
+            "`https://youtube.com/watch?v=xxxxx`",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
     
-    # إرسال رسالة انتظار
-    processing_msg = await update.message.reply_text(
-        "⏳ جاري معالجة الرابط...\n🔍 جلب معلومات الفيديو..."
+    # رسالة المعالجة
+    await update.message.reply_chat_action(ChatAction.TYPING)
+    status_msg = await update.message.reply_text(
+        "🔍 **جاري تحليل الرابط...**\n"
+        "⏳ الرجاء الانتظار...",
+        parse_mode=ParseMode.MARKDOWN
     )
     
-    # الحصول على معلومات الفيديو
-    video_info = YouTubeDownloader.get_video_info(url)
-    
-    if not video_info:
-        await processing_msg.edit_text(
-            "❌ فشل في الحصول على معلومات الفيديو!\n"
-            "تأكد من صحة الرابط وحاول مرة أخرى."
-        )
-        return
-    
-    # حفظ المعلومات مؤقتاً
-    video_info_cache[user_id] = video_info
-    
-    # إنشاء رسالة المعلومات
-    info_message = f"""
-🎬 **{video_info['title']}**
-
-👤 **القناة:** {video_info['uploader']}
-⏱ **المدة:** {format_duration(video_info['duration'])}
-👁 **المشاهدات:** {format_number(video_info['view_count'])}
-
-📝 **الوصف:**
-{video_info['description']}...
-
-✨ **اختر الجودة والصيغة المطلوبة:**
-    """
-    
-    # إنشاء لوحة الأزرار
-    keyboard = []
-    
-    # أزرار جودة الفيديو
-    quality_buttons = []
-    available_qualities = sorted(video_info['formats'].keys(), reverse=True)
-    
-    for i, quality in enumerate(available_qualities[:6]):  # حد أقصى 6 جودات
-        quality_buttons.append(
-            InlineKeyboardButton(
-                f"📹 {quality}p",
-                callback_data=f"quality_{quality}_mp4"
-            )
-        )
-        if (i + 1) % 2 == 0:
-            keyboard.append(quality_buttons)
-            quality_buttons = []
-    
-    if quality_buttons:
-        keyboard.append(quality_buttons)
-    
-    # أزرار الصوت
-    keyboard.append([
-        InlineKeyboardButton("🎵 MP3 Audio", callback_data="quality_audio_mp3"),
-        InlineKeyboardButton("🎼 M4A Audio", callback_data="quality_audio_m4a")
-    ])
-    
-    # زر الإلغاء
-    keyboard.append([
-        InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
-    ])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # إرسال الصورة المصغرة مع المعلومات
     try:
-        await processing_msg.delete()
-        if video_info['thumbnail']:
-            await update.message.reply_photo(
-                photo=video_info['thumbnail'],
-                caption=info_message,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup
+        # استخراج المعلومات
+        info = YouTubeDownloader.extract_info(text)
+        
+        if not info:
+            await status_msg.edit_text(
+                "❌ **فشل في جلب معلومات الفيديو!**\n\n"
+                "تأكد من:\n"
+                "• صحة الرابط\n"
+                "• الفيديو غير محذوف\n"
+                "• الفيديو غير خاص"
             )
+            return
+        
+        # حفظ في الذاكرة المؤقتة
+        video_cache[user_id] = info
+        
+        # رسالة المعلومات
+        info_text = f"""
+🎬 **{info['title']}**
+
+👤 القناة: `{info['uploader']}`
+⏱ المدة: `{format_duration(info['duration'])}`
+👁 المشاهدات: `{format_views(info['views'])}`
+
+📝 {info['description']}
+
+━━━━━━━━━━━━━━━━━━━━
+**اختر الجودة المطلوبة:**
+        """
+        
+        # بناء لوحة الأزرار
+        keyboard = []
+        
+        # أزرار الجودة
+        qualities = info['qualities'][:8]  # أول 8 جودات
+        row = []
+        for i, q in enumerate(qualities):
+            row.append(InlineKeyboardButton(f"📹 {q}p", callback_data=f"dl_{q}_mp4"))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        
+        # أزرار الصوت
+        keyboard.append([
+            InlineKeyboardButton("🎵 MP3 صوت فقط", callback_data="dl_audio_mp3")
+        ])
+        
+        # زر الإلغاء
+        keyboard.append([
+            InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
+        ])
+        
+        # حذف رسالة الحالة وإرسال المعلومات
+        await status_msg.delete()
+        
+        if info['thumbnail']:
+            try:
+                await update.message.reply_photo(
+                    photo=info['thumbnail'],
+                    caption=info_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except:
+                await update.message.reply_text(
+                    info_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
         else:
             await update.message.reply_text(
-                info_message,
+                info_text,
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            
     except Exception as e:
-        logger.error(f"خطأ في إرسال المعلومات: {e}")
-        await update.message.reply_text(
-            info_message,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
+        logger.error(f"خطأ في معالجة الرابط: {e}")
+        await status_msg.edit_text(
+            f"❌ **حدث خطأ!**\n\n"
+            f"`{str(e)}`\n\n"
+            f"حاول مرة أخرى.",
+            parse_mode=ParseMode.MARKDOWN
         )
 
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة ضغطات الأزرار"""
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج الأزرار"""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
     data = query.data
     
+    # زر الإلغاء
     if data == "cancel":
         await query.message.delete()
-        await query.message.reply_text("❌ تم الإلغاء!")
-        if user_id in video_info_cache:
-            del video_info_cache[user_id]
+        if user_id in video_cache:
+            del video_cache[user_id]
         return
     
+    # زر المساعدة
     if data == "help":
         help_text = """
-📖 **دليل الاستخدام:**
+📖 **دليل الاستخدام التفصيلي**
 
-1️⃣ **إرسال الرابط:**
-   أرسل رابط فيديو يوتيوب مباشرة
+━━━━━━━━━━━━━━━━━━━━
+**1️⃣ كيفية التحميل:**
 
-2️⃣ **اختيار الجودة:**
-   - 144p - 1080p للفيديو
-   - MP3/M4A للصوت فقط
+• انسخ رابط فيديو يوتيوب
+• أرسله للبوت
+• اختر الجودة
+• انتظر التحميل
 
-3️⃣ **التحميل:**
-   سيتم تحميل الفيديو وإرساله لك تلقائياً
+━━━━━━━━━━━━━━━━━━━━
+**2️⃣ الجودات المتاحة:**
 
-⚠️ **ملاحظات:**
-- الحد الأقصى للملف: 2GB
-- قد يستغرق التحميل بعض الوقت
-- الفيديوهات الطويلة تحتاج وقت أطول
+📹 144p - 1080p (فيديو)
+🎵 MP3 (صوت فقط)
 
-💬 للدعم: @YourSupportChannel
+━━━━━━━━━━━━━━━━━━━━
+**3️⃣ ملاحظات مهمة:**
+
+⚠️ الحد الأقصى: 2GB
+⏱ قد يستغرق وقتاً
+🔒 آمن 100%
+
+━━━━━━━━━━━━━━━━━━━━
+💬 للدعم: /start
         """
         await query.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
         return
     
+    # زر المعلومات
     if data == "about":
         about_text = """
-ℹ️ **حول البوت:**
+ℹ️ **معلومات البوت**
 
-🤖 **بوت تحميل يوتيوب الاحترافي**
-📌 الإصدار: 2.0.0
-⚡️ محرك التحميل: yt-dlp
+━━━━━━━━━━━━━━━━━━━━
+🤖 **بوت تحميل يوتيوب**
+📌 الإصدار: 2.1.0
+⚡️ المحرك: yt-dlp
 
-👨‍💻 **المطور:** Your Name
-🔗 **القناة:** @YourChannel
+━━━━━━━━━━━━━━━━━━━━
+🔧 **التقنيات:**
+• Python 3.11
+• python-telegram-bot
+• yt-dlp
 
-💝 **شكراً لاستخدامك البوت!**
+━━━━━━━━━━━━━━━━━━━━
+💝 شكراً لاستخدامك البوت!
         """
         await query.message.reply_text(about_text, parse_mode=ParseMode.MARKDOWN)
         return
     
-    if data.startswith("quality_"):
+    # معالجة التحميل
+    if data.startswith("dl_"):
         parts = data.split("_")
         quality = parts[1]
         format_type = parts[2]
         
-        if user_id not in video_info_cache:
+        # التحقق من وجود البيانات
+        if user_id not in video_cache:
             await query.message.reply_text(
-                "❌ انتهت صلاحية الجلسة. الرجاء إرسال الرابط مرة أخرى."
+                "❌ **انتهت الجلسة!**\n\n"
+                "الرجاء إرسال الرابط مرة أخرى.",
+                parse_mode=ParseMode.MARKDOWN
             )
             return
         
-        video_info = video_info_cache[user_id]
+        info = video_cache[user_id]
         
         # رسالة التحميل
         download_msg = await query.message.reply_text(
-            f"⬇️ جاري التحميل...\n"
-            f"📹 الجودة: {quality}\n"
-            f"📦 الصيغة: {format_type.upper()}\n\n"
-            f"⏳ الرجاء الانتظار..."
+            f"⬇️ **جاري التحميل...**\n\n"
+            f"📹 الجودة: `{quality}`\n"
+            f"📦 الصيغة: `{format_type.upper()}`\n\n"
+            f"⏳ قد يستغرق بضع دقائق...",
+            parse_mode=ParseMode.MARKDOWN
         )
         
         try:
-            # تحميل الفيديو
-            file_path = await YouTubeDownloader.download_video(
-                video_info['url'],
+            # التحميل
+            file_path, title = await YouTubeDownloader.download(
+                info['url'],
                 quality,
-                format_type
+                format_type,
+                download_msg
             )
             
             if not file_path or not os.path.exists(file_path):
                 await download_msg.edit_text(
-                    "❌ فشل التحميل! حاول مرة أخرى."
+                    "❌ **فشل التحميل!**\n\n"
+                    "حاول مرة أخرى أو جرب جودة أخرى.",
+                    parse_mode=ParseMode.MARKDOWN
                 )
                 return
             
-            # التحقق من حجم الملف
+            # فحص الحجم
             file_size = os.path.getsize(file_path)
-            if file_size > 2000 * 1024 * 1024:  # 2GB
-                await download_msg.edit_text(
-                    "❌ حجم الملف كبير جداً (أكثر من 2GB)!\n"
-                    "جرب جودة أقل."
-                )
+            if file_size > MAX_FILE_SIZE:
                 os.remove(file_path)
+                await download_msg.edit_text(
+                    "❌ **الملف كبير جداً!**\n\n"
+                    f"الحجم: `{file_size/(1024*1024):.1f} MB`\n"
+                    f"الحد الأقصى: `2000 MB`\n\n"
+                    "جرب جودة أقل.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
                 return
             
+            # الرفع
             await download_msg.edit_text(
-                "📤 جاري رفع الملف...\n"
-                "⏳ قد يستغرق هذا بعض الوقت..."
+                f"📤 **جاري الرفع...**\n\n"
+                f"📦 الحجم: `{file_size/(1024*1024):.1f} MB`\n"
+                f"⏳ الرجاء الانتظار...",
+                parse_mode=ParseMode.MARKDOWN
             )
             
-            # إرسال الملف
-            caption = f"✅ **{video_info['title']}**\n\n📹 {quality} | {format_type.upper()}"
+            caption = f"✅ **{title}**\n\n📹 {quality} • {format_type.upper()}"
             
-            with open(file_path, 'rb') as file:
-                if format_type in ['mp3', 'm4a']:
+            # إرسال الملف
+            with open(file_path, 'rb') as f:
+                if format_type == 'mp3':
                     await query.message.reply_audio(
-                        audio=file,
+                        audio=f,
                         caption=caption,
                         parse_mode=ParseMode.MARKDOWN,
-                        title=video_info['title'],
-                        performer=video_info['uploader']
+                        title=title,
+                        performer=info['uploader']
                     )
                 else:
                     await query.message.reply_video(
-                        video=file,
+                        video=f,
                         caption=caption,
                         parse_mode=ParseMode.MARKDOWN,
-                        supports_streaming=True
+                        supports_streaming=True,
+                        width=1280,
+                        height=720
                     )
             
+            # تنظيف
             await download_msg.delete()
-            
-            # حذف الملف المؤقت
             os.remove(file_path)
             
-            # حذف من الذاكرة المؤقتة
-            if user_id in video_info_cache:
-                del video_info_cache[user_id]
+            if user_id in video_cache:
+                del video_cache[user_id]
                 
         except Exception as e:
-            logger.error(f"خطأ في معالجة التحميل: {e}")
+            logger.error(f"خطأ في التحميل: {e}")
             await download_msg.edit_text(
-                f"❌ حدث خطأ أثناء المعالجة!\n"
-                f"الخطأ: {str(e)}\n\n"
-                f"حاول مرة أخرى أو اختر جودة مختلفة."
+                f"❌ **حدث خطأ!**\n\n"
+                f"`{str(e)}`\n\n"
+                f"حاول مرة أخرى.",
+                parse_mode=ParseMode.MARKDOWN
             )
+            
+            # حذف الملف إن وجد
+            if 'file_path' in locals() and file_path and os.path.exists(file_path):
+                os.remove(file_path)
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج الأخطاء العام"""
-    logger.error(f"حدث خطأ: {context.error}")
-    
-    try:
-        if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ حدث خطأ غير متوقع!\n"
-                "الرجاء المحاولة مرة أخرى لاحقاً."
-            )
-    except Exception as e:
-        logger.error(f"خطأ في معالج الأخطاء: {e}")
+    """معالج الأخطاء"""
+    logger.error(f"خطأ: {context.error}", exc_info=context.error)
 
 
 def main():
     """الدالة الرئيسية"""
-    if not TOKEN:
-        logger.error("BOT_TOKEN غير محدد!")
-        return
+    logger.info("🚀 بدء تشغيل البوت...")
     
-    # إنشاء التطبيق
-    application = Application.builder().token(TOKEN).build()
+    # بناء التطبيق
+    app = Application.builder().token(TOKEN).build()
     
-    # إضافة المعالجات
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    application.add_handler(CallbackQueryHandler(button_callback))
+    # المعالجات
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_error_handler(error_handler)
     
-    # معالج الأخطاء
-    application.add_error_handler(error_handler)
-    
-    # بدء البوت
-    logger.info("البوت يعمل الآن...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # التشغيل
+    logger.info("✅ البوت يعمل!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == '__main__':
